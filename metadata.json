@@ -1,0 +1,6 @@
+{
+  "name": "Thư viện Số",
+  "description": "Hệ thống quản lý thư viện điện tử cho trường cao đẳng - Quản lý sách bản mềm PDF, phân quyền và đọc tài liệu trực tuyến.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
