@@ -12,6 +12,21 @@ import {
   addFileVersion,
   incrementReadCount,
   incrementDownloadCount,
+  createBorrowRequest,
+  getBorrowRequests,
+  updateBorrowRequestStatus,
+  checkUserActiveBorrow,
+  toggleUserFavorite,
+  getUserFavorites,
+  saveReadingProgress,
+  getUserReadingHistory,
+  createBookReview,
+  getBookReviews,
+  deleteBookReview,
+  createBookNote,
+  getBookNotes,
+  deleteBookNote,
+  getAllBooksForExport,
 } from '../db/books.ts';
 import { savePdfToVault, getPdfStream, getPdfFileSize } from '../services/file.service.ts';
 import { recordAuditLog } from '../services/audit.service.ts';
@@ -26,7 +41,7 @@ const upload = multer({
   },
 });
 
-// 1. Lấy danh sách sách (Public / Học sinh chỉ thấy Published; Thủ thư/Admin thấy cả Draft, Archived)
+// 1. Lấy danh sách sách (Hỗ trợ bộ lọc nâng cao Milestone 2: search, faculty, subject, year, accessType, sortBy)
 booksRouter.get('/', optionalAuth, async (req: AuthRequest, res: Response) => {
   try {
     const isStaff = req.dbUser && ['admin', 'librarian'].includes(req.dbUser.role);
@@ -38,7 +53,12 @@ booksRouter.get('/', optionalAuth, async (req: AuthRequest, res: Response) => {
     const result = await getBooks({
       search: req.query.search as string,
       faculty: req.query.faculty as string,
+      subject: req.query.subject as string,
       status: effectiveStatus,
+      year: req.query.year ? parseInt(req.query.year as string, 10) : undefined,
+      accessType: req.query.accessType as any,
+      sortBy: req.query.sortBy as any,
+      userId: req.dbUser?.id,
       page: req.query.page ? parseInt(req.query.page as string, 10) : 1,
       limit: req.query.limit ? parseInt(req.query.limit as string, 10) : 12,
     });
@@ -49,10 +69,130 @@ booksRouter.get('/', optionalAuth, async (req: AuthRequest, res: Response) => {
   }
 });
 
-// 2. Lấy chi tiết sách
+// 2. Xuất danh mục sách (Export Catalog CSV) dành cho Thủ thư / Quản trị viên
+booksRouter.get('/export/catalog', requireAuth, requireRole(['admin', 'librarian']), async (req: AuthRequest, res: Response) => {
+  try {
+    const booksData = await getAllBooksForExport();
+
+    // Chuẩn bị CSV với BOM UTF-8 để mở chính xác trong Microsoft Excel tiếng Việt
+    const headers = [
+      'Mã tài liệu',
+      'Tiêu đề',
+      'Tác giả',
+      'ISBN',
+      'Nhà xuất bản',
+      'Năm XB',
+      'Khoa / Bộ môn',
+      'Chuyên ngành',
+      'Trạng thái',
+      'Lượt đọc',
+      'Lượt tải',
+      'Ngày tạo',
+    ];
+
+    const rows = booksData.map((b) => [
+      `"${(b.bookCode || '').replace(/"/g, '""')}"`,
+      `"${(b.title || '').replace(/"/g, '""')}"`,
+      `"${(b.author || '').replace(/"/g, '""')}"`,
+      `"${(b.isbn || '').replace(/"/g, '""')}"`,
+      `"${(b.publisher || '').replace(/"/g, '""')}"`,
+      b.publishYear || '',
+      `"${(b.faculty || '').replace(/"/g, '""')}"`,
+      `"${(b.subject || '').replace(/"/g, '""')}"`,
+      b.status,
+      b.readCount || 0,
+      b.downloadCount || 0,
+      b.createdAt ? new Date(b.createdAt).toLocaleDateString('vi-VN') : '',
+    ]);
+
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows.map((r) => r.join(','))].join('\r\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="danh-muc-tai-lieu-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(csvContent);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi xuất báo cáo danh mục sách' });
+  }
+});
+
+// 3. Quản lý Yêu cầu mượn / Cấp quyền tài liệu số (Borrow Requests)
+booksRouter.get('/borrow/requests', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const isStaff = ['admin', 'librarian'].includes(req.dbUser?.role || '');
+    // Nếu là sinh viên, chỉ lấy yêu cầu của chính họ; nếu là thủ thư/admin, lấy theo bộ lọc
+    const filterUserId = isStaff ? (req.query.userId as string) : req.dbUser?.id;
+    const filterStatus = req.query.status as string;
+
+    const list = await getBorrowRequests({
+      userId: filterUserId,
+      status: filterStatus,
+    });
+
+    res.json(list);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi tải danh sách yêu cầu mượn' });
+  }
+});
+
+booksRouter.patch('/borrow/requests/:requestId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { status, librarianNote, borrowDurationDays } = req.body;
+    const isStaff = ['admin', 'librarian'].includes(req.dbUser?.role || '');
+
+    // Chỉ thủ thư và admin mới có quyền Duyệt / Từ chối
+    if (['approved', 'rejected'].includes(status) && !isStaff) {
+      return res.status(403).json({ error: 'Chỉ thủ thư hoặc quản trị viên mới có quyền duyệt đơn mượn' });
+    }
+
+    const updated = await updateBorrowRequestStatus(req.params.requestId, {
+      status,
+      librarianNote,
+      approvedBy: isStaff ? req.dbUser?.email : undefined,
+      borrowDurationDays: borrowDurationDays ? parseInt(borrowDurationDays, 10) : undefined,
+    });
+
+    // Ghi audit log
+    await recordAuditLog({
+      userId: req.dbUser?.id,
+      userEmail: req.dbUser?.email,
+      action: `borrow_request_${status}`,
+      resourceType: 'borrow_request',
+      resourceId: req.params.requestId,
+      details: `Cập nhật trạng thái yêu cầu mượn sang "${status}". Ghi chú: ${librarianNote || 'Không có'}`,
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+    });
+
+    res.json(updated);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi cập nhật yêu cầu mượn' });
+  }
+});
+
+// 4. Kệ sách yêu thích cá nhân (User Favorites)
+booksRouter.get('/user/favorites', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const favorites = await getUserFavorites(req.dbUser!.id);
+    res.json(favorites);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi lấy danh sách yêu thích' });
+  }
+});
+
+// 5. Lịch sử và tiến độ đọc cá nhân (Reading History)
+booksRouter.get('/user/reading-history', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const history = await getUserReadingHistory(req.dbUser!.id);
+    res.json(history);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi lấy lịch sử đọc' });
+  }
+});
+
+// 6. Lấy chi tiết sách
 booksRouter.get('/:id', optionalAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const book = await getBookById(req.params.id);
+    const book = await getBookById(req.params.id, req.dbUser?.id);
     if (!book) {
       return res.status(404).json({ error: 'Không tìm thấy tài liệu này trong thư viện' });
     }
@@ -68,7 +208,7 @@ booksRouter.get('/:id', optionalAuth, async (req: AuthRequest, res: Response) =>
   }
 });
 
-// 3. Thủ thư & Admin: Tạo mới sách và upload PDF
+// 7. Tạo mới sách và upload PDF (Thủ thư & Admin)
 booksRouter.post(
   '/',
   requireAuth,
@@ -93,6 +233,7 @@ booksRouter.post(
         allowStudentRead,
         allowStudentDownload,
         isOnlineOnly,
+        requiresApproval,
       } = req.body;
 
       if (!bookCode || !title || !author) {
@@ -101,7 +242,6 @@ booksRouter.post(
 
       let fileData;
       if (req.file) {
-        // Lưu và kiểm tra tệp an toàn trong kho bảo mật
         const saved = savePdfToVault(req.file.path);
         fileData = {
           fileName: req.file.originalname,
@@ -132,119 +272,134 @@ booksRouter.post(
           allowStudentRead: allowStudentRead === 'true' || allowStudentRead === true,
           allowStudentDownload: allowStudentDownload === 'true' || allowStudentDownload === true,
           isOnlineOnly: isOnlineOnly === 'true' || isOnlineOnly === true,
+          requiresApproval: requiresApproval === 'true' || requiresApproval === true,
         },
       });
 
-      // Ghi audit log
       await recordAuditLog({
         userId: req.dbUser?.id,
         userEmail: req.dbUser?.email,
-        action: 'upload_book',
+        action: 'create_book',
         resourceType: 'book',
         resourceId: newBook.id,
-        details: `Đã thêm sách mới [${bookCode}] "${title}" kèm tệp PDF: ${req.file?.originalname || 'Chưa đính kèm'}`,
+        details: `Đã tạo tài liệu mới: "${newBook.title}" (Mã: ${newBook.bookCode})`,
         ipAddress: req.ip,
         userAgent: req.get('user-agent'),
       });
 
       res.status(201).json(newBook);
     } catch (error: any) {
-      console.error('Lỗi khi thêm sách:', error);
-      res.status(500).json({ error: error.message || 'Lỗi khi lưu tài liệu sách' });
+      console.error('Lỗi tạo sách:', error);
+      res.status(500).json({ error: error.message || 'Lỗi thêm tài liệu' });
     }
   }
 );
 
-// 4. Thủ thư & Admin: Cập nhật metadata và trạng thái
-booksRouter.put('/:id', requireAuth, requireRole(['admin', 'librarian']), async (req: AuthRequest, res: Response) => {
-  try {
-    const { id } = req.params;
-    const {
-      title,
-      author,
-      isbn,
-      publisher,
-      publishYear,
-      faculty,
-      subject,
-      description,
-      keywords,
-      coverUrl,
-      status,
-      allowStudentRead,
-      allowStudentDownload,
-      isOnlineOnly,
-    } = req.body;
-
-    const updated = await updateBookMetadata(id, {
-      title,
-      author,
-      isbn,
-      publisher,
-      publishYear: publishYear ? parseInt(publishYear, 10) : undefined,
-      faculty,
-      subject,
-      description,
-      keywords,
-      coverUrl,
-      status,
-    });
-
-    if (allowStudentRead !== undefined || allowStudentDownload !== undefined || isOnlineOnly !== undefined) {
-      await updateBookPolicy(id, {
+// 8. Cập nhật thông tin & Chính sách sách (Thủ thư & Admin)
+booksRouter.patch(
+  '/:id',
+  requireAuth,
+  requireRole(['admin', 'librarian']),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const {
+        title,
+        author,
+        isbn,
+        publisher,
+        publishYear,
+        categoryId,
+        faculty,
+        subject,
+        description,
+        keywords,
+        coverUrl,
+        status,
         allowStudentRead,
         allowStudentDownload,
         isOnlineOnly,
+        requiresApproval,
+      } = req.body;
+
+      const updatedBook = await updateBookMetadata(req.params.id, {
+        ...(title && { title }),
+        ...(author && { author }),
+        ...(isbn !== undefined && { isbn }),
+        ...(publisher !== undefined && { publisher }),
+        ...(publishYear !== undefined && { publishYear: parseInt(publishYear, 10) || null }),
+        ...(categoryId !== undefined && { categoryId }),
+        ...(faculty !== undefined && { faculty }),
+        ...(subject !== undefined && { subject }),
+        ...(description !== undefined && { description }),
+        ...(keywords !== undefined && { keywords }),
+        ...(coverUrl !== undefined && { coverUrl }),
+        ...(status && { status }),
       });
+
+      if (
+        allowStudentRead !== undefined ||
+        allowStudentDownload !== undefined ||
+        isOnlineOnly !== undefined ||
+        requiresApproval !== undefined
+      ) {
+        await updateBookPolicy(req.params.id, {
+          ...(allowStudentRead !== undefined && { allowStudentRead: Boolean(allowStudentRead) }),
+          ...(allowStudentDownload !== undefined && { allowStudentDownload: Boolean(allowStudentDownload) }),
+          ...(isOnlineOnly !== undefined && { isOnlineOnly: Boolean(isOnlineOnly) }),
+          ...(requiresApproval !== undefined && { requiresApproval: Boolean(requiresApproval) }),
+        });
+      }
+
+      await recordAuditLog({
+        userId: req.dbUser?.id,
+        userEmail: req.dbUser?.email,
+        action: 'update_book',
+        resourceType: 'book',
+        resourceId: req.params.id,
+        details: `Đã cập nhật thông tin/chính sách tài liệu: "${updatedBook.title}"`,
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+
+      res.json(updatedBook);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Lỗi cập nhật tài liệu' });
     }
-
-    await recordAuditLog({
-      userId: req.dbUser?.id,
-      userEmail: req.dbUser?.email,
-      action: 'update_book',
-      resourceType: 'book',
-      resourceId: id,
-      details: `Đã cập nhật metadata/trạng thái [${status}] sách "${title || updated?.title}"`,
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent'),
-    });
-
-    res.json(updated);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Lỗi cập nhật sách' });
   }
-});
+);
 
-// 5. Thủ thư & Admin: Upload phiên bản tệp PDF mới
+// 9. Thêm phiên bản tệp PDF mới (Versioning)
 booksRouter.post(
-  '/:id/version',
+  '/:id/versions',
   requireAuth,
   requireRole(['admin', 'librarian']),
   upload.single('pdfFile'),
   async (req: AuthRequest, res: Response) => {
     try {
-      const { id } = req.params;
       if (!req.file) {
-        return res.status(400).json({ error: 'Vui lòng chọn tệp PDF cần tải lên' });
+        return res.status(400).json({ error: 'Vui lòng chọn tệp PDF mới cần tải lên' });
       }
 
+      const changelog = req.body.changelog || 'Cập nhật phiên bản tài liệu mới';
       const saved = savePdfToVault(req.file.path);
-      const newVersion = await addFileVersion(id, {
+
+      const newVersion = await addFileVersion(req.params.id, {
         fileName: req.file.originalname,
         storedPath: saved.storedPath,
         fileSize: saved.size,
         mimeType: 'application/pdf',
         checksum: saved.checksum,
+        changelog,
         uploadedBy: req.dbUser?.id,
       });
 
       await recordAuditLog({
         userId: req.dbUser?.id,
         userEmail: req.dbUser?.email,
-        action: 'upload_version',
+        action: 'upload_new_version',
         resourceType: 'book',
-        resourceId: id,
-        details: `Đã tải lên phiên bản mới (v${newVersion.version}) tệp: ${req.file.originalname} (SHA-256: ${saved.checksum.substring(0, 10)}...)`,
+        resourceId: req.params.id,
+        details: `Đã tải lên phiên bản PDF v${newVersion.version} (${newVersion.fileName}). Ghi chú: ${changelog}`,
         ipAddress: req.ip,
         userAgent: req.get('user-agent'),
       });
@@ -256,7 +411,166 @@ booksRouter.post(
   }
 );
 
-// 6. Endpoint Đọc Online Bảo vệ (Stream PDF - Không lộ đường dẫn tệp thực tế)
+// 10. Gửi yêu cầu mượn tài liệu số / cấp quyền tải (Borrow Request)
+booksRouter.post('/:id/borrow-request', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { purpose, borrowDurationDays, requestType } = req.body;
+    if (!purpose || !purpose.trim()) {
+      return res.status(400).json({ error: 'Vui lòng nêu rõ mục đích mượn / sử dụng tài liệu' });
+    }
+
+    const created = await createBorrowRequest({
+      bookId: req.params.id,
+      userId: req.dbUser!.id,
+      userEmail: req.dbUser!.email,
+      userName: req.dbUser!.fullName || req.dbUser!.email.split('@')[0],
+      purpose: purpose.trim(),
+      borrowDurationDays: borrowDurationDays ? parseInt(borrowDurationDays, 10) : 14,
+      requestType: requestType || 'read',
+    });
+
+    await recordAuditLog({
+      userId: req.dbUser?.id,
+      userEmail: req.dbUser?.email,
+      action: 'request_borrow',
+      resourceType: 'book',
+      resourceId: req.params.id,
+      details: `Học sinh/sinh viên gửi yêu cầu mượn ${created.borrowDurationDays} ngày: "${created.purpose}"`,
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+    });
+
+    res.status(201).json(created);
+  } catch (error: any) {
+    res.status(400).json({ error: error.message || 'Lỗi gửi yêu cầu mượn sách' });
+  }
+});
+
+// 11. Toggle Yêu thích (Bookmark)
+booksRouter.post('/:id/favorite', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await toggleUserFavorite(req.dbUser!.id, req.params.id);
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi thao tác yêu thích' });
+  }
+});
+
+// 12. Lưu tiến độ đọc (Reading Progress)
+booksRouter.post('/:id/reading-progress', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { lastPage, totalPages } = req.body;
+    if (!lastPage) {
+      return res.status(400).json({ error: 'Trang đọc không hợp lệ' });
+    }
+
+    const saved = await saveReadingProgress(
+      req.dbUser!.id,
+      req.params.id,
+      parseInt(lastPage, 10),
+      parseInt(totalPages || '1', 10)
+    );
+
+    res.json(saved);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi lưu tiến độ đọc' });
+  }
+});
+
+// 13. Đánh giá & Nhận xét sách (Book Reviews)
+booksRouter.get('/:id/reviews', async (req, res) => {
+  try {
+    const reviews = await getBookReviews(req.params.id);
+    res.json(reviews);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi tải đánh giá' });
+  }
+});
+
+booksRouter.post('/:id/reviews', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { rating, comment } = req.body;
+    if (!rating || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'Điểm đánh giá phải từ 1 đến 5 sao' });
+    }
+
+    const review = await createBookReview({
+      bookId: req.params.id,
+      userId: req.dbUser!.id,
+      userEmail: req.dbUser!.email,
+      userName: req.dbUser!.fullName || req.dbUser!.email.split('@')[0],
+      rating: parseInt(rating, 10),
+      comment: comment?.trim(),
+    });
+
+    await recordAuditLog({
+      userId: req.dbUser?.id,
+      userEmail: req.dbUser?.email,
+      action: 'review_book',
+      resourceType: 'book',
+      resourceId: req.params.id,
+      details: `Đánh giá ${review.rating} sao kèm nhận xét`,
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+    });
+
+    res.status(201).json(review);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi thêm nhận xét' });
+  }
+});
+
+booksRouter.delete('/reviews/:reviewId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const isStaff = ['admin', 'librarian'].includes(req.dbUser?.role || '');
+    await deleteBookReview(req.params.reviewId, req.dbUser!.id, isStaff);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi xóa nhận xét' });
+  }
+});
+
+// 14. Ghi chú cá nhân trong PDF (In-document Notes)
+booksRouter.get('/:id/notes', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const notes = await getBookNotes(req.params.id, req.dbUser!.id);
+    res.json(notes);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi tải ghi chú cá nhân' });
+  }
+});
+
+booksRouter.post('/:id/notes', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { pageNumber, content, color } = req.body;
+    if (!content || !content.trim()) {
+      return res.status(400).json({ error: 'Nội dung ghi chú không được rỗng' });
+    }
+
+    const note = await createBookNote({
+      bookId: req.params.id,
+      userId: req.dbUser!.id,
+      pageNumber: parseInt(pageNumber || '1', 10),
+      content: content.trim(),
+      color: color || 'amber',
+    });
+
+    res.status(201).json(note);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi tạo ghi chú' });
+  }
+});
+
+booksRouter.delete('/notes/:noteId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    await deleteBookNote(req.params.noteId, req.dbUser!.id);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Lỗi xóa ghi chú' });
+  }
+});
+
+// 15. Endpoint Đọc Online Bảo vệ (Stream PDF - Kiểm tra quyền & đơn mượn số)
 booksRouter.get('/:id/stream', optionalAuth, async (req: AuthRequest, res: Response) => {
   try {
     const book = await getBookById(req.params.id);
@@ -265,14 +579,28 @@ booksRouter.get('/:id/stream', optionalAuth, async (req: AuthRequest, res: Respo
     }
 
     const isStaff = req.dbUser && ['admin', 'librarian'].includes(req.dbUser.role);
+    const activeBorrow = await checkUserActiveBorrow(book.id, req.dbUser?.id);
 
     // Kiểm tra quyền đọc
     if (!isStaff) {
       if (book.status !== 'published') {
         return res.status(403).json({ error: 'Tài liệu chưa được xuất bản' });
       }
-      if (book.accessPolicy && !book.accessPolicy.allowStudentRead) {
-        return res.status(403).json({ error: 'Chính sách hiện tại không cho phép học sinh đọc tài liệu này' });
+
+      // Nếu sách yêu cầu duyệt đơn mượn
+      if (book.accessPolicy?.requiresApproval && !activeBorrow) {
+        return res.status(403).json({
+          error: 'Tài liệu này yêu cầu gửi Đơn mượn số và được Thủ thư phê duyệt trước khi đọc.',
+          requiresApproval: true,
+        });
+      }
+
+      // Nếu chính sách không cho phép sinh viên đọc tự do và cũng không có đơn mượn hợp lệ
+      if (book.accessPolicy && !book.accessPolicy.allowStudentRead && !activeBorrow) {
+        return res.status(403).json({
+          error: 'Chính sách hiện tại không cho phép đọc tự do tài liệu này. Bạn có thể gửi đơn mượn cho Thủ thư.',
+          requiresApproval: true,
+        });
       }
     }
 
@@ -308,12 +636,12 @@ booksRouter.get('/:id/stream', optionalAuth, async (req: AuthRequest, res: Respo
       fileStream.pipe(res);
     }
 
-    // Tăng lượt đọc và ghi audit log (chỉ ghi khi bắt đầu đọc)
+    // Tăng lượt đọc và ghi audit log (chỉ ghi khi bắt đầu đọc trang đầu)
     if (!range || range.startsWith('bytes=0-')) {
       incrementReadCount(book.id);
       recordAuditLog({
         userId: req.dbUser?.id,
-        userEmail: req.dbUser?.email || 'Guest Student',
+        userEmail: req.dbUser?.email || 'Khách vãng lai',
         action: 'view_book',
         resourceType: 'book',
         resourceId: book.id,
@@ -328,7 +656,7 @@ booksRouter.get('/:id/stream', optionalAuth, async (req: AuthRequest, res: Respo
   }
 });
 
-// 7. Endpoint Tải xuống có kiểm soát (Download)
+// 16. Endpoint Tải xuống có kiểm soát (Download)
 booksRouter.get('/:id/download', optionalAuth, async (req: AuthRequest, res: Response) => {
   try {
     const book = await getBookById(req.params.id);
@@ -337,21 +665,27 @@ booksRouter.get('/:id/download', optionalAuth, async (req: AuthRequest, res: Res
     }
 
     const isStaff = req.dbUser && ['admin', 'librarian'].includes(req.dbUser.role);
+    const activeBorrow = await checkUserActiveBorrow(book.id, req.dbUser?.id);
+    const hasDownloadPermissionFromBorrow =
+      activeBorrow && (activeBorrow.requestType === 'download' || activeBorrow.requestType === 'both');
 
     // Kiểm tra chính sách tải file
     if (!isStaff) {
-      if (!book.accessPolicy?.allowStudentDownload) {
-        return res.status(403).json({
-          error: 'Chính sách thư viện không cho phép tải tài liệu này về máy. Bạn chỉ có thể đọc trực tuyến.',
-        });
-      }
-      if (book.accessPolicy?.isOnlineOnly) {
-        return res.status(403).json({
-          error: 'Đây là tài liệu được phân loại "Chỉ đọc online" (Online Only) theo quy chế bản quyền.',
-        });
-      }
       if (book.status !== 'published') {
         return res.status(403).json({ error: 'Tài liệu chưa được cấp phép phát hành' });
+      }
+
+      if (!hasDownloadPermissionFromBorrow) {
+        if (!book.accessPolicy?.allowStudentDownload) {
+          return res.status(403).json({
+            error: 'Chính sách thư viện không cho phép tải tài liệu này về máy. Bạn có thể gửi Yêu cầu cấp quyền tải cho Thủ thư.',
+          });
+        }
+        if (book.accessPolicy?.isOnlineOnly) {
+          return res.status(403).json({
+            error: 'Đây là tài liệu được phân loại "Chỉ đọc online". Bạn có thể gửi Đơn mượn/xin quyền tải để Thủ thư phê duyệt.',
+          });
+        }
       }
     }
 
@@ -362,7 +696,7 @@ booksRouter.get('/:id/download', optionalAuth, async (req: AuthRequest, res: Res
     await incrementDownloadCount(book.id);
     await recordAuditLog({
       userId: req.dbUser?.id,
-      userEmail: req.dbUser?.email || 'Guest Student',
+      userEmail: req.dbUser?.email || 'Khách vãng lai',
       action: 'download_book',
       resourceType: 'book',
       resourceId: book.id,

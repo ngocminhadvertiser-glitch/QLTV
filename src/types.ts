@@ -20,6 +20,7 @@ export interface BookFile {
   mimeType: string;
   checksum: string;
   version: number;
+  changelog?: string | null;
   isCurrent: boolean;
   createdAt: string;
 }
@@ -57,6 +58,71 @@ export interface Book {
   accessPolicy?: AccessPolicy | null;
   currentFile?: BookFile | null;
   versions?: BookFile[];
+  averageRating?: number;
+  reviewCount?: number;
+  isFavorite?: boolean;
+  userBorrowStatus?: 'none' | 'pending' | 'approved' | 'rejected' | 'returned' | 'expired';
+  userBorrowExpiresAt?: string | null;
+  readingProgress?: ReadingHistory | null;
+}
+
+export interface BorrowRequest {
+  id: string;
+  bookId: string;
+  userId: string;
+  userEmail: string;
+  userName: string;
+  requestType: 'read' | 'download' | 'both';
+  purpose: string;
+  borrowDurationDays: number;
+  status: 'pending' | 'approved' | 'rejected' | 'returned' | 'expired';
+  librarianNote?: string | null;
+  approvedBy?: string | null;
+  approvedAt?: string | null;
+  expiresAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  book?: Book;
+}
+
+export interface BookReview {
+  id: string;
+  bookId: string;
+  userId: string;
+  userEmail: string;
+  userName: string;
+  rating: number;
+  comment?: string | null;
+  createdAt: string;
+}
+
+export interface BookNote {
+  id: string;
+  bookId: string;
+  userId: string;
+  pageNumber: number;
+  content: string;
+  color: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReadingHistory {
+  id: string;
+  userId: string;
+  bookId: string;
+  lastPage: number;
+  totalPages: number;
+  updatedAt: string;
+  book?: Book;
+}
+
+export interface UserFavorite {
+  id: string;
+  userId: string;
+  bookId: string;
+  createdAt: string;
+  book?: Book;
 }
 
 export interface AuditLog {
@@ -78,6 +144,8 @@ export interface DashboardStats {
   draftBooks: number;
   totalReads: number;
   totalDownloads: number;
+  pendingBorrowRequests?: number;
+  totalReviews?: number;
   facultyStats: {
     faculty: string;
     count: number;
